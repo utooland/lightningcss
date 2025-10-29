@@ -1530,10 +1530,8 @@ where
     //    append a single SPACE (U+0020), followed by the combinator
     //    to s.
     if let Some(combinator) = next_combinator {
-      if !combinators_exhausted {
-        dest.write_char(' ')?;
-        combinator.to_css(dest)?;
-      }
+      dest.write_char(' ')?;
+      combinator.to_css(dest)?;
     }
 
     combinators_exhausted = combinators.next().is_none();
