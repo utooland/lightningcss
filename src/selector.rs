@@ -805,7 +805,7 @@ where
     Local { selector } => serialize_selector(selector, dest, context, false),
     Global { selector } => {
       let css_module = std::mem::take(&mut dest.css_module);
-      serialize_selector(selector, dest, context, false)?;
+      serialize_selector_with_css_modules(selector, dest, context, false, false)?;
       dest.css_module = css_module;
       Ok(())
     }
@@ -1381,7 +1381,180 @@ impl<'a, 'i> ToCss for Selector<'i> {
   }
 }
 
+fn serialize_selector_with_css_modules<'a, 'i, W>(
+  selector: &Selector<'i>,
+  dest: &mut Printer<W>,
+  context: Option<&StyleContext>,
+  mut is_relative: bool,
+  handle_css_modules: bool,
+) -> Result<(), PrinterError>
+where
+  W: fmt::Write,
+{
+  use parcel_selectors::parser::*;
+  // Compound selectors invert the order of their contents, so we need to
+  // undo that during serialization.
+  //
+  // This two-iterator strategy involves walking over the selector twice.
+  // We could do something more clever, but selector serialization probably
+  // isn't hot enough to justify it, and the stringification likely
+  // dominates anyway.
+  //
+  // NB: A parse-order iterator is a Rev<>, which doesn't expose as_slice(),
+  // which we need for |split|. So we split by combinators on a match-order
+  // sequence and then reverse.
+
+  let mut combinators = selector.iter_raw_match_order().rev().filter_map(|x| x.as_combinator());
+  let compound_selectors = selector.iter_raw_match_order().as_slice().split(|x| x.is_combinator()).rev();
+  let should_compile_nesting = should_compile!(dest.targets.current, Nesting);
+
+  let mut first = true;
+  let mut combinators_exhausted = false;
+  for mut compound in compound_selectors {
+    debug_assert!(!combinators_exhausted);
+
+    // Skip implicit :scope in relative selectors (e.g. :has(:scope > foo) -> :has(> foo))
+    if is_relative && matches!(compound.get(0), Some(Component::Scope)) {
+      if let Some(combinator) = combinators.next() {
+        combinator.to_css(dest)?;
+      }
+      compound = &compound[1..];
+      is_relative = false;
+    }
+
+    // https://drafts.csswg.org/cssom/#serializing-selectors
+    if compound.is_empty() {
+      continue;
+    }
+
+    let has_leading_nesting = first && matches!(compound[0], Component::Nesting);
+    let first_index = if has_leading_nesting { 1 } else { 0 };
+    first = false;
+
+    // 1. If there is only one simple selector in the compound selectors
+    //    which is a universal selector, append the result of
+    //    serializing the universal selector to s.
+    //
+    // Check if `!compound.empty()` first--this can happen if we have
+    // something like `... > ::before`, because we store `>` and `::`
+    // both as combinators internally.
+    //
+    // If we are in this case, after we have serialized the universal
+    // selector, we skip Step 2 and continue with the algorithm.
+    let (can_elide_namespace, first_non_namespace) = match compound.get(first_index) {
+      Some(Component::ExplicitAnyNamespace)
+      | Some(Component::ExplicitNoNamespace)
+      | Some(Component::Namespace(..)) => (false, first_index + 1),
+      Some(Component::DefaultNamespace(..)) => (true, first_index + 1),
+      _ => (true, first_index),
+    };
+    let mut perform_step_2 = true;
+    let next_combinator = combinators.next();
+    if first_non_namespace == compound.len() - 1 {
+      match (next_combinator, &compound[first_non_namespace]) {
+        // We have to be careful here, because if there is a
+        // pseudo element "combinator" there isn't really just
+        // the one simple selector. Technically this compound
+        // selector contains the pseudo element selector as well
+        // -- Combinator::PseudoElement, just like
+        // Combinator::SlotAssignment, don't exist in the
+        // spec.
+        (Some(Combinator::PseudoElement), _) | (Some(Combinator::SlotAssignment), _) => (),
+        (_, &Component::ExplicitUniversalType) => {
+          // Iterate over everything so we serialize the namespace
+          // too.
+          let mut iter = compound.iter();
+          let swap_nesting = has_leading_nesting && should_compile_nesting;
+          if swap_nesting {
+            // Swap nesting and type selector (e.g. &div -> div&).
+            iter.next();
+          }
+
+          for simple in iter {
+            serialize_component_with_css_modules(simple, dest, context, handle_css_modules)?;
+          }
+
+          if swap_nesting {
+            serialize_nesting(dest, context, false)?;
+          }
+
+          // Skip step 2, which is an "otherwise".
+          perform_step_2 = false;
+        }
+        _ => (),
+      }
+    }
+
+    // 2. Otherwise, for each simple selector in the compound selectors
+    //    that is not a universal selector of which the namespace prefix
+    //    maps to a namespace that is not the default namespace
+    //    serialize the simple selector and append the result to s.
+    //
+    // See https://github.com/w3c/csswg-drafts/issues/1606, which is
+    // proposing to change this to match up with the behavior asserted
+    // in cssom/serialize-namespaced-type-selectors.html, which the
+    // following code tries to match.
+    if perform_step_2 {
+      let mut iter = compound.iter();
+      if has_leading_nesting && should_compile_nesting && is_type_selector(compound.get(first_non_namespace)) {
+        // Swap nesting and type selector (e.g. &div -> div&).
+        let nesting = iter.next().unwrap();
+        let local = iter.next().unwrap();
+        serialize_component_with_css_modules(local, dest, context, handle_css_modules)?;
+
+        // Also check the next item in case of namespaces.
+        if first_non_namespace > first_index {
+          let local = iter.next().unwrap();
+          serialize_component_with_css_modules(local, dest, context, handle_css_modules)?;
+        }
+
+        serialize_component_with_css_modules(nesting, dest, context, handle_css_modules)?;
+      } else if has_leading_nesting && should_compile_nesting {
+        // Nesting selector may serialize differently if it is leading, due to type selectors.
+        iter.next();
+        serialize_nesting(dest, context, true)?;
+      }
+
+      for simple in iter {
+        // Skip namespace selectors if we can elide them.
+        if can_elide_namespace && first_non_namespace > first_index {
+          if let Component::DefaultNamespace(..) = simple {
+            continue;
+          }
+        }
+        serialize_component_with_css_modules(simple, dest, context, handle_css_modules)?;
+      }
+    }
+
+    // 3. If this is not the last part of the chain of the selector
+    //    append a single SPACE (U+0020), followed by the combinator
+    //    to s.
+    if let Some(combinator) = next_combinator {
+      if !combinators_exhausted {
+        dest.write_char(' ')?;
+        combinator.to_css(dest)?;
+      }
+    }
+
+    combinators_exhausted = combinators.next().is_none();
+  }
+
+  Ok(())
+}
+
 fn serialize_selector<'a, 'i, W>(
+  selector: &Selector<'i>,
+  dest: &mut Printer<W>,
+  context: Option<&StyleContext>,
+  mut is_relative: bool,
+) -> Result<(), PrinterError>
+where
+  W: fmt::Write,
+{
+  serialize_selector_with_css_modules(selector, dest, context, is_relative, true)
+}
+
+fn serialize_selector_old<'a, 'i, W>(
   selector: &Selector<'i>,
   dest: &mut Printer<W>,
   context: Option<&StyleContext>,
@@ -1549,7 +1722,171 @@ where
   Ok(())
 }
 
+fn serialize_component_with_css_modules<'a, 'i, W>(
+  component: &Component,
+  dest: &mut Printer<W>,
+  context: Option<&StyleContext>,
+  handle_css_modules: bool,
+) -> Result<(), PrinterError>
+where
+  W: fmt::Write,
+{
+  match component {
+    Component::Combinator(ref c) => c.to_css(dest),
+    Component::AttributeInNoNamespace {
+      ref local_name,
+      operator,
+      ref value,
+      case_sensitivity,
+      ..
+    } => {
+      dest.write_char('[')?;
+      cssparser::ToCss::to_css(local_name, dest)?;
+      cssparser::ToCss::to_css(operator, dest)?;
+
+      if dest.minify {
+        // Serialize as both an identifier and a string and choose the shorter one.
+        let mut id = String::new();
+        serialize_identifier(&value, &mut id)?;
+
+        let s = value.to_css_string(Default::default())?;
+
+        if id.len() > 0 && id.len() < s.len() {
+          dest.write_str(&id)?;
+        } else {
+          dest.write_str(&s)?;
+        }
+      } else {
+        value.to_css(dest)?;
+      }
+
+      match case_sensitivity {
+        parcel_selectors::attr::ParsedCaseSensitivity::CaseSensitive
+        | parcel_selectors::attr::ParsedCaseSensitivity::AsciiCaseInsensitiveIfInHtmlElementInHtmlDocument => {}
+        parcel_selectors::attr::ParsedCaseSensitivity::AsciiCaseInsensitive => dest.write_str(" i")?,
+        parcel_selectors::attr::ParsedCaseSensitivity::ExplicitCaseSensitive => dest.write_str(" s")?,
+      }
+      dest.write_char(']')
+    }
+    Component::Is(ref list)
+    | Component::Where(ref list)
+    | Component::Negation(ref list)
+    | Component::Any(_, ref list) => {
+      match *component {
+        Component::Where(..) => dest.write_str(":where(")?,
+        Component::Is(ref selectors) => {
+          // If there's only one simple selector, serialize it directly.
+          if should_unwrap_is(selectors) {
+            serialize_selector_with_css_modules(selectors.first().unwrap(), dest, context, false, handle_css_modules)?;
+            return Ok(());
+          }
+
+          let vp = dest.vendor_prefix;
+          if vp.intersects(VendorPrefix::WebKit | VendorPrefix::Moz) {
+            dest.write_char(':')?;
+            vp.to_css(dest)?;
+            dest.write_str("any(")?;
+          } else {
+            dest.write_str(":is(")?;
+          }
+        }
+        Component::Negation(_) => {
+          dest.write_str(":not(")?;
+        }
+        Component::Any(prefix, ..) => {
+          let vp = dest.vendor_prefix.or(prefix);
+          if vp.intersects(VendorPrefix::WebKit | VendorPrefix::Moz) {
+            dest.write_char(':')?;
+            vp.to_css(dest)?;
+            dest.write_str("any(")?;
+          } else {
+            dest.write_str(":is(")?;
+          }
+        }
+        _ => unreachable!(),
+      }
+      serialize_selector_list_with_css_modules(list.iter(), dest, context, false, handle_css_modules)?;
+      dest.write_str(")")
+    }
+    Component::Has(ref list) => {
+      dest.write_str(":has(")?;
+      serialize_selector_list_with_css_modules(list.iter(), dest, context, true, handle_css_modules)?;
+      dest.write_str(")")
+    }
+    Component::NonTSPseudoClass(pseudo) => serialize_pseudo_class(pseudo, dest, context),
+    Component::PseudoElement(pseudo) => serialize_pseudo_element(pseudo, dest, context),
+    Component::Nesting => serialize_nesting(dest, context, false),
+    Component::Class(ref class) => {
+      dest.write_char('.')?;
+      dest.write_ident(&class.0, handle_css_modules)
+    }
+    Component::ID(ref id) => {
+      dest.write_char('#')?;
+      dest.write_ident(&id.0, handle_css_modules)
+    }
+    Component::Host(selector) => {
+      dest.write_str(":host")?;
+      if let Some(ref selector) = *selector {
+        dest.write_char('(')?;
+        serialize_selector_with_css_modules(selector, dest, context, false, handle_css_modules)?;
+        dest.write_char(')')?;
+      }
+      Ok(())
+    }
+    Component::Slotted(ref selector) => {
+      dest.write_str("::slotted(")?;
+      serialize_selector_with_css_modules(selector, dest, context, false, handle_css_modules)?;
+      dest.write_char(')')
+    }
+    Component::NthOf(ref nth_of_data) => {
+      let nth_data = nth_of_data.nth_data();
+      nth_data.write_start(dest, true)?;
+      nth_data.write_affine(dest)?;
+      dest.write_str(" of ")?;
+      serialize_selector_list_with_css_modules(nth_of_data.selectors().iter(), dest, context, true, handle_css_modules)?;
+      dest.write_char(')')
+    }
+    _ => {
+      cssparser::ToCss::to_css(component, dest)?;
+      Ok(())
+    }
+  }
+}
+
+fn serialize_selector_list_with_css_modules<'a, 'i: 'a, I, W>(
+  iter: I,
+  dest: &mut Printer<W>,
+  context: Option<&StyleContext>,
+  is_relative: bool,
+  handle_css_modules: bool,
+) -> Result<(), PrinterError>
+where
+  I: Iterator<Item = &'a Selector<'i>>,
+  W: fmt::Write,
+{
+  let mut first = true;
+  for selector in iter {
+    if !first {
+      dest.delim(',', false)?;
+    }
+    first = false;
+    serialize_selector_with_css_modules(selector, dest, context, is_relative, handle_css_modules)?;
+  }
+  Ok(())
+}
+
 fn serialize_component<'a, 'i, W>(
+  component: &Component,
+  dest: &mut Printer<W>,
+  context: Option<&StyleContext>,
+) -> Result<(), PrinterError>
+where
+  W: fmt::Write,
+{
+  serialize_component_with_css_modules(component, dest, context, true)
+}
+
+fn serialize_component_old<'a, 'i, W>(
   component: &Component,
   dest: &mut Printer<W>,
   context: Option<&StyleContext>,
