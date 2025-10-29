@@ -804,9 +804,11 @@ where
 
     Local { selector } => serialize_selector(selector, dest, context, false),
     Global { selector } => {
+      dest.write_str(":global(")?;
       let css_module = std::mem::take(&mut dest.css_module);
       serialize_selector_with_css_modules(selector, dest, context, false, false)?;
       dest.css_module = css_module;
+      dest.write_char(')')?;
       Ok(())
     }
 
