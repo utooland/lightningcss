@@ -1409,9 +1409,7 @@ where
   let should_compile_nesting = should_compile!(dest.targets.current, Nesting);
 
   let mut first = true;
-  let mut combinators_exhausted = false;
   for mut compound in compound_selectors {
-    debug_assert!(!combinators_exhausted);
 
     // Skip implicit :scope in relative selectors (e.g. :has(:scope > foo) -> :has(> foo))
     if is_relative && matches!(compound.get(0), Some(Component::Scope)) {
@@ -1534,7 +1532,6 @@ where
       combinator.to_css(dest)?;
     }
 
-    combinators_exhausted = combinators.next().is_none();
   }
 
   Ok(())
