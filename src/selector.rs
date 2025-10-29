@@ -104,8 +104,13 @@ impl<'a, 'o, 'i> parcel_selectors::parser::Parser<'i> for SelectorParser<'a, 'o,
       // CSS Modules non-functional aliases: :local and :global without arguments
       // Treat them as if they were functional with a nesting selector argument, i.e.
       // :local(&) and :global(&), so they affect nested rules blocks like `:global { ... }`.
-      "local" if self.options.css_modules.is_some() => Local { selector: Box::new(Selector::from(Component::Nesting)) },
-      "global" if self.options.css_modules.is_some() => Global { selector: Box::new(Selector::from(Component::Nesting)) },
+      "local" if self.options.css_modules.is_some() => {
+        Local { selector: Box::new(Selector::from(Component::Nesting)) }
+      },
+      "global" if self.options.css_modules.is_some() => {
+        dbg!("global");
+        Global { selector: Box::new(Selector::from(Component::Nesting)) }
+      },
       // https://drafts.csswg.org/selectors-4/#useraction-pseudos
       "hover" => Hover,
       "active" => Active,
