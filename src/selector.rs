@@ -1388,7 +1388,7 @@ fn serialize_selector_with_css_modules<'a, 'i, W>(
   dest: &mut Printer<W>,
   context: Option<&StyleContext>,
   mut is_relative: bool,
-  handle_css_modules: bool,
+  mut handle_css_modules: bool,
 ) -> Result<(), PrinterError>
 where
   W: fmt::Write,
@@ -1471,7 +1471,7 @@ where
           }
 
           for simple in iter {
-            serialize_component_with_css_modules(simple, dest, context, handle_css_modules)?;
+            serialize_component_with_css_modules(simple, dest, context, &mut handle_css_modules)?;
           }
 
           if swap_nesting {
@@ -1500,15 +1500,15 @@ where
         // Swap nesting and type selector (e.g. &div -> div&).
         let nesting = iter.next().unwrap();
         let local = iter.next().unwrap();
-        serialize_component_with_css_modules(local, dest, context, handle_css_modules)?;
+        serialize_component_with_css_modules(local, dest, context, &mut handle_css_modules)?;
 
         // Also check the next item in case of namespaces.
         if first_non_namespace > first_index {
           let local = iter.next().unwrap();
-          serialize_component_with_css_modules(local, dest, context, handle_css_modules)?;
+          serialize_component_with_css_modules(local, dest, context, &mut handle_css_modules)?;
         }
 
-        serialize_component_with_css_modules(nesting, dest, context, handle_css_modules)?;
+        serialize_component_with_css_modules(nesting, dest, context, &mut handle_css_modules)?;
       } else if has_leading_nesting && should_compile_nesting {
         // Nesting selector may serialize differently if it is leading, due to type selectors.
         iter.next();
@@ -1522,7 +1522,7 @@ where
             continue;
           }
         }
-        serialize_component_with_css_modules(simple, dest, context, handle_css_modules)?;
+        serialize_component_with_css_modules(simple, dest, context, &mut handle_css_modules)?;
       }
     }
 
@@ -1556,7 +1556,7 @@ fn serialize_component_with_css_modules<'a, 'i, W>(
   component: &Component,
   dest: &mut Printer<W>,
   context: Option<&StyleContext>,
-  handle_css_modules: bool,
+  handle_css_modules: &mut bool,
 ) -> Result<(), PrinterError>
 where
   W: fmt::Write,
@@ -1607,7 +1607,7 @@ where
         Component::Is(ref selectors) => {
           // If there's only one simple selector, serialize it directly.
           if should_unwrap_is(selectors) {
-            serialize_selector_with_css_modules(selectors.first().unwrap(), dest, context, false, handle_css_modules)?;
+            serialize_selector_with_css_modules(selectors.first().unwrap(), dest, context, false, *handle_css_modules)?;
             return Ok(());
           }
 
@@ -1635,37 +1635,55 @@ where
         }
         _ => unreachable!(),
       }
-      serialize_selector_list_with_css_modules(list.iter(), dest, context, false, handle_css_modules)?;
+      serialize_selector_list_with_css_modules(list.iter(), dest, context, false, *handle_css_modules)?;
       dest.write_str(")")
     }
     Component::Has(ref list) => {
       dest.write_str(":has(")?;
-      serialize_selector_list_with_css_modules(list.iter(), dest, context, true, handle_css_modules)?;
+      serialize_selector_list_with_css_modules(list.iter(), dest, context, true, *handle_css_modules)?;
       dest.write_str(")")
     }
-    Component::NonTSPseudoClass(pseudo) => serialize_pseudo_class(pseudo, dest, context),
+    Component::NonTSPseudoClass(pseudo) => {
+      // Intercept CSS Modules Local/Global to mutate hashing behavior for the remaining chain
+      match pseudo {
+        PseudoClass::Local { selector } => {
+          dest.write_str(":local(")?;
+          serialize_selector_with_css_modules(selector, dest, context, false, true)?;
+          dest.write_char(')')
+        }
+        PseudoClass::Global { selector } => {
+          dest.write_str(":global(")?;
+          serialize_selector_with_css_modules(selector, dest, context, false, false)?;
+          dest.write_char(')')?;
+          // Switch off css modules hashing for the rest of this selector chain
+          *handle_css_modules = false;
+          Ok(())
+        }
+        _ => serialize_pseudo_class(pseudo, dest, context),
+      }
+    }
     Component::PseudoElement(pseudo) => serialize_pseudo_element(pseudo, dest, context),
     Component::Nesting => serialize_nesting(dest, context, false),
     Component::Class(ref class) => {
       dest.write_char('.')?;
-      dest.write_ident(&class.0, handle_css_modules)
+      dest.write_ident(&class.0, *handle_css_modules)
     }
     Component::ID(ref id) => {
       dest.write_char('#')?;
-      dest.write_ident(&id.0, handle_css_modules)
+      dest.write_ident(&id.0, *handle_css_modules)
     }
     Component::Host(selector) => {
       dest.write_str(":host")?;
       if let Some(ref selector) = *selector {
         dest.write_char('(')?;
-        serialize_selector_with_css_modules(selector, dest, context, false, handle_css_modules)?;
+        serialize_selector_with_css_modules(selector, dest, context, false, *handle_css_modules)?;
         dest.write_char(')')?;
       }
       Ok(())
     }
     Component::Slotted(ref selector) => {
       dest.write_str("::slotted(")?;
-      serialize_selector_with_css_modules(selector, dest, context, false, handle_css_modules)?;
+      serialize_selector_with_css_modules(selector, dest, context, false, *handle_css_modules)?;
       dest.write_char(')')
     }
     Component::NthOf(ref nth_of_data) => {
@@ -1673,7 +1691,7 @@ where
       nth_data.write_start(dest, true)?;
       nth_data.write_affine(dest)?;
       dest.write_str(" of ")?;
-      serialize_selector_list_with_css_modules(nth_of_data.selectors().iter(), dest, context, true, handle_css_modules)?;
+      serialize_selector_list_with_css_modules(nth_of_data.selectors().iter(), dest, context, true, *handle_css_modules)?;
       dest.write_char(')')
     }
     _ => {
@@ -1713,7 +1731,8 @@ fn serialize_component<'a, 'i, W>(
 where
   W: fmt::Write,
 {
-  serialize_component_with_css_modules(component, dest, context, true)
+  let mut handle = true;
+  serialize_component_with_css_modules(component, dest, context, &mut handle)
 }
 
 
