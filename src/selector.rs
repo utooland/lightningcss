@@ -1652,10 +1652,19 @@ where
           dest.write_char(')')
         }
         PseudoClass::Global { selector } => {
+          // If it's the implicit non-functional :global alias (i.e. :global(&)),
+          // don't print the wrapper, just disable hashing for the rest of the chain.
+          let parts = selector.iter_raw_match_order().as_slice();
+          if parts.len() == 1 {
+            if let parcel_selectors::parser::Component::Nesting = parts[0] {
+              *handle_css_modules = false;
+              return Ok(());
+            }
+          }
+          // Otherwise, preserve explicit :global(<selector>) in the output
           dest.write_str(":global(")?;
           serialize_selector_with_css_modules(selector, dest, context, false, false)?;
           dest.write_char(')')?;
-          // Switch off css modules hashing for the rest of this selector chain
           *handle_css_modules = false;
           Ok(())
         }
