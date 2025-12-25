@@ -193,11 +193,15 @@ impl<'a, 'o, 'i> parcel_selectors::parser::Parser<'i> for SelectorParser<'a, 'o,
       "no-button" => WebKitScrollbar(WebKitScrollbarPseudoClass::NoButton),
       "corner-present" => WebKitScrollbar(WebKitScrollbarPseudoClass::CornerPresent),
       "window-inactive" => WebKitScrollbar(WebKitScrollbarPseudoClass::WindowInactive),
-
-      "local" | "global" if self.options.css_modules.is_some() => {
-        return Err(loc.new_custom_error(SelectorParseErrorKind::AmbiguousCssModuleClass(name.clone())))
+      // CSS Modules non-functional aliases: :local and :global without arguments
+      // Treat them as if they were functional with a nesting selector argument, i.e.
+      // :local(&) and :global(&), so they affect nested rules blocks like `:global { ... }`.
+      "local" if self.options.css_modules.is_some() => {
+        Local { selector: Box::new(Selector::from(Component::Nesting)) }
       },
-
+      "global" if self.options.css_modules.is_some() => {
+        Global { selector: Box::new(Selector::from(Component::Nesting)) }
+      },
       _ => {
         if !name.starts_with('-') {
           self.options.warn(loc.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClass(name.clone())));
@@ -812,12 +816,35 @@ where
       dest.write_char(')')
     }
 
-    Local { selector } => serialize_selector(selector, dest, context, false),
-    Global { selector } => {
-      let css_module = std::mem::take(&mut dest.css_module);
+    Local { selector } => {
+      // If it's the implicit non-functional :local alias (i.e. :local(&)),
+      // don't print anything, just keep hashing enabled (default behavior).
+      let parts = selector.iter_raw_match_order().as_slice();
+      if parts.len() == 1 {
+        if let parcel_selectors::parser::Component::Nesting = parts[0] {
+          return Ok(());
+        }
+      }
+      // Otherwise, preserve explicit :local(<selector>) in the output
+      dest.write_str(":local(")?;
       serialize_selector(selector, dest, context, false)?;
+      dest.write_char(')')
+    }
+    Global { selector } => {
+      // If it's the implicit non-functional :global alias (i.e. :global(&)),
+      // don't print anything.
+      let parts = selector.iter_raw_match_order().as_slice();
+      if parts.len() == 1 {
+        if let parcel_selectors::parser::Component::Nesting = parts[0] {
+          return Ok(());
+        }
+      }
+      // Otherwise, preserve explicit :global(<selector>) in the output
+      dest.write_str(":global(")?;
+      let css_module = std::mem::take(&mut dest.css_module);
+      serialize_selector_with_css_modules(selector, dest, context, false, false)?;
       dest.css_module = css_module;
-      Ok(())
+      dest.write_char(')')
     }
 
     // https://webkit.org/blog/363/styling-scrollbars/
@@ -1395,11 +1422,12 @@ impl<'a, 'i> ToCss for Selector<'i> {
   }
 }
 
-fn serialize_selector<'a, 'i, W>(
+fn serialize_selector_with_css_modules<'a, 'i, W>(
   selector: &Selector<'i>,
   dest: &mut Printer<W>,
   context: Option<&StyleContext>,
   mut is_relative: bool,
+  mut handle_css_modules: bool,
 ) -> Result<(), PrinterError>
 where
   W: fmt::Write,
@@ -1422,10 +1450,7 @@ where
   let should_compile_nesting = should_compile!(dest.targets.current, Nesting);
 
   let mut first = true;
-  let mut combinators_exhausted = false;
   for mut compound in compound_selectors {
-    debug_assert!(!combinators_exhausted);
-
     // Skip implicit :scope in relative selectors (e.g. :has(:scope > foo) -> :has(> foo))
     if is_relative && matches!(compound.get(0), Some(Component::Scope)) {
       if let Some(combinator) = combinators.next() {
@@ -1484,7 +1509,7 @@ where
           }
 
           for simple in iter {
-            serialize_component(simple, dest, context)?;
+            serialize_component_with_css_modules(simple, dest, context, &mut handle_css_modules)?;
           }
 
           if swap_nesting {
@@ -1511,18 +1536,17 @@ where
       let mut iter = compound.iter();
       if has_leading_nesting && should_compile_nesting && is_type_selector(compound.get(first_non_namespace)) {
         // Swap nesting and type selector (e.g. &div -> div&).
-        // This ensures that the compiled selector is valid. e.g. (div.foo is valid, .foodiv is not).
         let nesting = iter.next().unwrap();
         let local = iter.next().unwrap();
-        serialize_component(local, dest, context)?;
+        serialize_component_with_css_modules(local, dest, context, &mut handle_css_modules)?;
 
         // Also check the next item in case of namespaces.
         if first_non_namespace > first_index {
           let local = iter.next().unwrap();
-          serialize_component(local, dest, context)?;
+          serialize_component_with_css_modules(local, dest, context, &mut handle_css_modules)?;
         }
 
-        serialize_component(nesting, dest, context)?;
+        serialize_component_with_css_modules(nesting, dest, context, &mut handle_css_modules)?;
       } else if has_leading_nesting && should_compile_nesting {
         // Nesting selector may serialize differently if it is leading, due to type selectors.
         iter.next();
@@ -1530,43 +1554,44 @@ where
       }
 
       for simple in iter {
-        if let Component::ExplicitUniversalType = *simple {
-          // Can't have a namespace followed by a pseudo-element
-          // selector followed by a universal selector in the same
-          // compound selector, so we don't have to worry about the
-          // real namespace being in a different `compound`.
-          if can_elide_namespace {
+        // Skip namespace selectors if we can elide them.
+        if can_elide_namespace && first_non_namespace > first_index {
+          if let Component::DefaultNamespace(..) = simple {
             continue;
           }
         }
-        serialize_component(simple, dest, context)?;
+        serialize_component_with_css_modules(simple, dest, context, &mut handle_css_modules)?;
       }
     }
 
     // 3. If this is not the last part of the chain of the selector
     //    append a single SPACE (U+0020), followed by the combinator
-    //    ">", "+", "~", ">>", "||", as appropriate, followed by another
-    //    single SPACE (U+0020) if the combinator was not whitespace, to
-    //    s.
-    match next_combinator {
-      Some(c) => c.to_css(dest)?,
-      None => combinators_exhausted = true,
-    };
-
-    // 4. If this is the last part of the chain of the selector and
-    //    there is a pseudo-element, append "::" followed by the name of
-    //    the pseudo-element, to s.
-    //
-    // (we handle this above)
+    //    to s.
+    if let Some(combinator) = next_combinator {
+      combinator.to_css(dest)?;
+    }
   }
 
   Ok(())
 }
 
-fn serialize_component<'a, 'i, W>(
+fn serialize_selector<'a, 'i, W>(
+  selector: &Selector<'i>,
+  dest: &mut Printer<W>,
+  context: Option<&StyleContext>,
+  is_relative: bool,
+) -> Result<(), PrinterError>
+where
+  W: fmt::Write,
+{
+  serialize_selector_with_css_modules(selector, dest, context, is_relative, true)
+}
+
+fn serialize_component_with_css_modules<'a, 'i, W>(
   component: &Component,
   dest: &mut Printer<W>,
   context: Option<&StyleContext>,
+  handle_css_modules: &mut bool,
 ) -> Result<(), PrinterError>
 where
   W: fmt::Write,
@@ -1617,7 +1642,13 @@ where
         Component::Is(ref selectors) => {
           // If there's only one simple selector, serialize it directly.
           if should_unwrap_is(selectors) {
-            serialize_selector(selectors.first().unwrap(), dest, context, false)?;
+            serialize_selector_with_css_modules(
+              selectors.first().unwrap(),
+              dest,
+              context,
+              false,
+              *handle_css_modules,
+            )?;
             return Ok(());
           }
 
@@ -1645,37 +1676,82 @@ where
         }
         _ => unreachable!(),
       }
-      serialize_selector_list(list.iter(), dest, context, false)?;
+      serialize_selector_list_with_css_modules(list.iter(), dest, context, false, *handle_css_modules)?;
       dest.write_str(")")
     }
     Component::Has(ref list) => {
       dest.write_str(":has(")?;
-      serialize_selector_list(list.iter(), dest, context, true)?;
+      serialize_selector_list_with_css_modules(list.iter(), dest, context, true, *handle_css_modules)?;
       dest.write_str(")")
     }
-    Component::NonTSPseudoClass(pseudo) => serialize_pseudo_class(pseudo, dest, context),
+    Component::NonTSPseudoClass(pseudo) => {
+      // Intercept CSS Modules Local/Global to mutate hashing behavior for the remaining chain
+      match pseudo {
+        PseudoClass::Local { selector } => {
+          // If it's the implicit non-functional :local alias (i.e. :local(&)),
+          // don't print the wrapper, just keep hashing enabled for the rest of the chain.
+          let parts = selector.iter_raw_match_order().as_slice();
+          if parts.len() == 1 {
+            if let parcel_selectors::parser::Component::Nesting = parts[0] {
+              return Ok(());
+            }
+          }
+          // For CSS modules: unwrap :local() and serialize inner selector with hashing
+          // For non-CSS modules: preserve the :local() wrapper
+          if dest.css_module.is_some() {
+            serialize_selector_with_css_modules(selector, dest, context, false, true)
+          } else {
+            dest.write_str(":local(")?;
+            serialize_selector_with_css_modules(selector, dest, context, false, true)?;
+            dest.write_char(')')
+          }
+        }
+        PseudoClass::Global { selector } => {
+          // If it's the implicit non-functional :global alias (i.e. :global(&)),
+          // don't print the wrapper, just disable hashing for the rest of the chain.
+          let parts = selector.iter_raw_match_order().as_slice();
+          if parts.len() == 1 {
+            if let parcel_selectors::parser::Component::Nesting = parts[0] {
+              *handle_css_modules = false;
+              return Ok(());
+            }
+          }
+          // For CSS modules: unwrap :global() and serialize inner selector without hashing
+          // The handle_css_modules flag is NOT changed - only the inner selector is global
+          // For non-CSS modules: preserve the :global() wrapper
+          if dest.css_module.is_some() {
+            serialize_selector_with_css_modules(selector, dest, context, false, false)
+          } else {
+            dest.write_str(":global(")?;
+            serialize_selector_with_css_modules(selector, dest, context, false, false)?;
+            dest.write_char(')')
+          }
+        }
+        _ => serialize_pseudo_class(pseudo, dest, context),
+      }
+    }
     Component::PseudoElement(pseudo) => serialize_pseudo_element(pseudo, dest, context),
     Component::Nesting => serialize_nesting(dest, context, false),
     Component::Class(ref class) => {
       dest.write_char('.')?;
-      dest.write_ident(&class.0, true)
+      dest.write_ident(&class.0, *handle_css_modules)
     }
     Component::ID(ref id) => {
       dest.write_char('#')?;
-      dest.write_ident(&id.0, true)
+      dest.write_ident(&id.0, *handle_css_modules)
     }
     Component::Host(selector) => {
       dest.write_str(":host")?;
       if let Some(ref selector) = *selector {
         dest.write_char('(')?;
-        selector.to_css(dest)?;
+        serialize_selector_with_css_modules(selector, dest, context, false, *handle_css_modules)?;
         dest.write_char(')')?;
       }
       Ok(())
     }
     Component::Slotted(ref selector) => {
       dest.write_str("::slotted(")?;
-      selector.to_css(dest)?;
+      serialize_selector_with_css_modules(selector, dest, context, false, *handle_css_modules)?;
       dest.write_char(')')
     }
     Component::NthOf(ref nth_of_data) => {
@@ -1683,7 +1759,13 @@ where
       nth_data.write_start(dest, true)?;
       nth_data.write_affine(dest)?;
       dest.write_str(" of ")?;
-      serialize_selector_list(nth_of_data.selectors().iter(), dest, context, true)?;
+      serialize_selector_list_with_css_modules(
+        nth_of_data.selectors().iter(),
+        dest,
+        context,
+        true,
+        *handle_css_modules,
+      )?;
       dest.write_char(')')
     }
     _ => {
@@ -1691,6 +1773,28 @@ where
       Ok(())
     }
   }
+}
+
+fn serialize_selector_list_with_css_modules<'a, 'i: 'a, I, W>(
+  iter: I,
+  dest: &mut Printer<W>,
+  context: Option<&StyleContext>,
+  is_relative: bool,
+  handle_css_modules: bool,
+) -> Result<(), PrinterError>
+where
+  I: Iterator<Item = &'a Selector<'i>>,
+  W: fmt::Write,
+{
+  let mut first = true;
+  for selector in iter {
+    if !first {
+      dest.delim(',', false)?;
+    }
+    first = false;
+    serialize_selector_with_css_modules(selector, dest, context, is_relative, handle_css_modules)?;
+  }
+  Ok(())
 }
 
 fn should_unwrap_is<'i>(selectors: &Box<[Selector<'i>]>) -> bool {
