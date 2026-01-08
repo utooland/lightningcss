@@ -275,9 +275,9 @@ impl<'a, 'o, 'i, T: crate::traits::AtRuleParser<'i>> AtRuleParser<'i> for TopLev
   ) -> Result<Self::Prelude, ParseError<'i, Self::Error>> {
     match_ignore_ascii_case! { &*name,
       "import" => {
-        if self.state > State::Imports {
-          return Err(input.new_custom_error(ParserError::UnexpectedImportRule))
-        }
+        // if self.state > State::Imports {
+        //   return Err(input.new_custom_error(ParserError::UnexpectedImportRule))
+        // }
 
         let url_string = input.expect_url_or_string()?.clone();
 
