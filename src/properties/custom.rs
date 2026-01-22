@@ -384,11 +384,21 @@ impl<'i> TokenList<'i> {
             input.reset(&state);
             tokens.push(TokenOrValue::Url(Url::parse(input)?));
           } else if f == "var" {
-            let var = input.parse_nested_block(|input| {
-              let var = Variable::parse(input, options, depth + 1)?;
-              Ok(TokenOrValue::Var(var))
-            })?;
-            tokens.push(var);
+            // Try to parse as a valid var() reference, fall back to treating as a generic function
+            if let Ok(var) = input.try_parse(|input| {
+              input.parse_nested_block(|input| {
+                let var = Variable::parse(input, options, depth + 1)?;
+                Ok(TokenOrValue::Var(var))
+              })
+            }) {
+              tokens.push(var);
+            } else {
+              let arguments = input.parse_nested_block(|input| TokenList::parse(input, options, depth + 1))?;
+              tokens.push(TokenOrValue::Function(Function {
+                name: Ident(f),
+                arguments,
+              }));
+            }
           } else if f == "env" {
             let env = input.parse_nested_block(|input| {
               let env = EnvironmentVariable::parse_nested(input, options, depth + 1)?;
