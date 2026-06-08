@@ -26553,6 +26553,34 @@ mod tests {
       false,
     );
 
+    css_modules_test(
+      r#"
+      .caseRoot :global .test-tree-node:hover :local .operation {
+        display: inline-block;
+      }
+
+      .caseRoot :global .test-tree-node :local .operation {
+        display: none;
+      }
+    "#,
+      indoc! {r#"
+      .EgL3uq_caseRoot  .test-tree-node:hover  .EgL3uq_operation {
+        display: inline-block;
+      }
+
+      .EgL3uq_caseRoot  .test-tree-node  .EgL3uq_operation {
+        display: none;
+      }
+    "#},
+      map! {
+        "caseRoot" => "EgL3uq_caseRoot",
+        "operation" => "EgL3uq_operation"
+      },
+      HashMap::new(),
+      Default::default(),
+      false,
+    );
+
     // :global(:local(.hi)) {
     //   color: green;
     // }
