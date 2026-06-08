@@ -1728,6 +1728,7 @@ where
           let parts = selector.iter_raw_match_order().as_slice();
           if parts.len() == 1 {
             if let parcel_selectors::parser::Component::Nesting = parts[0] {
+              *handle_css_modules = true;
               return Ok(());
             }
           }
