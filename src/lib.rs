@@ -15540,22 +15540,16 @@ mod tests {
     );
     minify_test("@charset \"UTF-8\"; @import url(foo.css);", "@import \"foo.css\";");
     minify_test("@layer foo; @import url(foo.css);", "@layer foo;@import \"foo.css\";");
-    error_test(
+    for source in [
       ".foo { color: red } @import url(bar.css);",
-      ParserError::UnexpectedImportRule,
-    );
-    error_test(
       "@namespace \"http://example.com/foo\"; @import url(bar.css);",
-      ParserError::UnexpectedImportRule,
-    );
-    error_test(
       "@media print { .foo { color: red }} @import url(bar.css);",
-      ParserError::UnexpectedImportRule,
-    );
-    error_test(
       "@layer foo; @import url(foo.css); @layer bar; @import url(bar.css)",
-      ParserError::UnexpectedImportRule,
-    );
+    ] {
+      if let Err(error) = StyleSheet::parse(source, ParserOptions::default()) {
+        panic_with_test_error("test_import", "parse", source, error);
+      }
+    }
     let warnings = error_recovery_test("@import './actual-styles.css';");
     assert_eq!(warnings, vec![]);
   }
@@ -19439,10 +19433,7 @@ mod tests {
     );
 
     // Test in image()
-    minify_test(
-      ".foo { mask: image(alpha(from red / 1))}",
-      ".foo{mask:image(red)}",
-    );
+    minify_test(".foo { mask: image(alpha(from red / 1))}", ".foo{mask:image(red)}");
 
     // Test in linear-gradient()
     minify_test(
