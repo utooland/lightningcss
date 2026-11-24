@@ -1,0 +1,24 @@
+src/lib.rs
+  s_d10c1a395207e3::t_ccccb7504b8749 28388
+  s_d10c1a395207e3::t_7d7f73d2114a6e 28375-28383,28390-28404
+  s_d10c1a395207e3::t_58d6309840a6c1 28384-28387,28389
+src/properties/prefix_handler.rs
+  s_d10c1a395207e3::t_68744ea4adf422 94,97,101-102,111,125-126,128,156,159-174,177-178
+  s_d10c1a395207e3::t_ccccb7504b8749 124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "39e4ebb2ee4d07809dd2ae2334bfc227dec03128",
+  "prompts": {},
+  "sessions": {
+    "s_d10c1a395207e3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20e4f-1f15-7963-9ed3-a4c3a166dfd4",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "zoomdong <zoomdong@U-0K627Y2C-2335.local>"
+    }
+  }
+}
